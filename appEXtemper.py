@@ -32,6 +32,15 @@ class MultiSourceMarketData:
     def fetch_ohlc(self, symbol: str) -> tuple[pd.DataFrame, str]:
         clean_code = symbol.split('.')[0].upper()
 
+        # 優先嘗試 yfinance 取得盤中即時價與歷史 K 線
+        try:
+            df = self._fetch_yfinance(symbol)
+            if not df.empty and len(df) >= 30:
+                return df, "yfinance (即時行情)"
+        except Exception:
+            pass
+
+        # 陸股/台股 備援管道
         try:
             df = self._fetch_eastmoney(symbol, clean_code)
             if not df.empty and len(df) >= 30:
@@ -69,14 +78,62 @@ class MultiSourceMarketData:
             except Exception:
                 pass
 
-        try:
-            df = self._fetch_yfinance(symbol)
-            if not df.empty and len(df) >= 30:
-                return df, "yfinance (備用)"
-        except Exception:
-            pass
-
         raise ValueError(f"無法獲取 {symbol} 行情數據，請確認代碼是否正確。")
+
+    def _fetch_yfinance(self, symbol: str) -> pd.DataFrame:
+        clean_code = symbol.split('.')[0].upper()
+        
+        if clean_code.isdigit() and not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
+            if clean_code.startswith(("60", "688", "51", "56", "58")):
+                yf_symbol = f"{clean_code}.SS"
+            elif clean_code.startswith(("00", "01", "300", "15", "16", "18")):
+                yf_symbol = f"{clean_code}.SZ"
+            else:
+                yf_symbol = symbol
+        else:
+            yf_symbol = symbol
+
+        for attempt in range(3):
+            try:
+                ticker = yf.Ticker(yf_symbol)
+                df = ticker.history(period="1y")
+                
+                if not df.empty and len(df) >= 30:
+                    df = df.reset_index()
+                    df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
+                    df.set_index('Date', inplace=True)
+                    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
+
+                    # 盤中即時價格補全邏輯
+                    try:
+                        fast_price = ticker.fast_info.last_price
+                        if fast_price is not None and not np.isnan(fast_price):
+                            today_date = pd.to_datetime(datetime.now().strftime("%Y-%m-%d"))
+                            
+                            # 若今日 K 線已存在則更新，不存在則新增一行
+                            if today_date in df.index:
+                                df.loc[today_date, 'Close'] = float(fast_price)
+                                df.loc[today_date, 'High'] = max(df.loc[today_date, 'High'], float(fast_price))
+                                df.loc[today_date, 'Low'] = min(df.loc[today_date, 'Low'], float(fast_price))
+                            else:
+                                last_close = df.iloc[-1]['Close']
+                                new_row = pd.Series({
+                                    'Open': last_close,
+                                    'High': max(last_close, float(fast_price)),
+                                    'Low': min(last_close, float(fast_price)),
+                                    'Close': float(fast_price),
+                                    'Volume': 0.0
+                                }, name=today_date)
+                                df = pd.concat([df, pd.DataFrame([new_row])])
+                    except Exception:
+                        pass
+
+                    return df
+            except Exception:
+                pass
+            time.sleep(1.0 * (attempt + 1))
+
+        return pd.DataFrame()
 
     def _fetch_eastmoney_fund(self, fund_code: str) -> pd.DataFrame:
         url = "https://api.fund.eastmoney.com/f10/lsjz"
@@ -227,35 +284,6 @@ class MultiSourceMarketData:
         df.set_index('Date', inplace=True)
         return df[['Open', 'High', 'Low', 'Close', 'Volume']]
 
-    def _fetch_yfinance(self, symbol: str) -> pd.DataFrame:
-        clean_code = symbol.split('.')[0].upper()
-        
-        if clean_code.isdigit() and not (symbol.endswith(".TW") or symbol.endswith(".TWO")):
-            if clean_code.startswith(("60", "688", "51", "56", "58")):
-                yf_symbol = f"{clean_code}.SS"
-            elif clean_code.startswith(("00", "01", "300", "15", "16", "18")):
-                yf_symbol = f"{clean_code}.SZ"
-            else:
-                yf_symbol = symbol
-        else:
-            yf_symbol = symbol
-
-        for attempt in range(3):
-            try:
-                ticker = yf.Ticker(yf_symbol)
-                df = ticker.history(period="1y")
-                
-                if not df.empty and len(df) >= 30:
-                    df = df.reset_index()
-                    df['Date'] = pd.to_datetime(df['Date']).dt.tz_localize(None)
-                    df.set_index('Date', inplace=True)
-                    return df[['Open', 'High', 'Low', 'Close', 'Volume']].dropna()
-            except Exception:
-                pass
-            time.sleep(1.0 * (attempt + 1))
-
-        return pd.DataFrame()
-
 
 # ==========================================
 # 2. 動態溫控主升段最大化策略引擎 (滿倉極限獲利版)
@@ -344,7 +372,7 @@ class TradingStrategyEngine:
         ma60_upward = float(today['MA60_Slope']) > 0
         rsi14 = float(today['RSI14'])
         temp = float(today['Temperature'])
-        atr14 = float(today['ATR14'])  # <--- 補上這行宣告變數
+        atr14 = float(today['ATR14'])
         high_20 = float(today['High_20']) if not np.isnan(today['High_20']) else float(today['High'])
 
         vol_ratio = volume / ma10_vol_prev if ma10_vol_prev > 0 else 0.0
@@ -358,11 +386,11 @@ class TradingStrategyEngine:
             "MA60_Trend": "向上走牛 ↗️" if ma60_upward else "走平/向下 ↘️",
             "RSI14": rsi14, "High_20": high_20,
             "Temperature": temp,
-            "ATR14": atr14,  # <--- 將這一行加回來
+            "ATR14": atr14,
             "KLine_Date": str(df_ind.index[-1].strftime("%Y-%m-%d"))
         }
 
-        # 持倉資金轉換 (保留 10 層邏輯以相容歷史紀錄，4層=40%，6層=60%)
+        # 持倉資金轉換 (4層=40%，6層=60%)
         tranches_held = pos_summary['tranches_held']
         avg_cost = pos_summary['avg_cost']
         
@@ -376,26 +404,19 @@ class TradingStrategyEngine:
             if last_trade_date >= metrics["KLine_Date"]:
                 return metrics, [{"type": "info", "action_code": "COMPLETED", "title": "🟢 當前 K 線進場訊號已執行完畢", "desc": f"您已於 {last_trade_date} 完成此輪交易操作。請耐心等待新交易日。（目前持倉：{tranches_held*10:.0f}%）"}]
 
-        # ==================================
-        # 防守與逃頂機制 (持有部位時觸發)
-        # ==================================
+        # 防守與逃頂機制
         if tranches_held > 0:
-            # 1. 沸點反轉逃頂 (溫度 > 95°C 且跌破 MA5 或昨日低點)
             if temp > 95.0 and (price < yesterday_low or price < ma5):
                 return metrics, [{"type": "warning", "action_code": "SELL_ALL", "title": "🔥 策略建議：沸點反轉，一鍵逃頂", "desc": f"當前溫度極度超買 ({temp:.1f}°C)，且價格轉弱跌破 MA5/前低！判定高檔反轉，請立即全數清倉鎖定最大獲利。"}]
 
-            # 2. 絕對 8% 停損斷頭線 (保障 20 萬極限虧損 16,000)
             hard_stop_price = avg_cost * 0.92
             if price <= hard_stop_price:
                 return metrics, [{"type": "error", "action_code": "STOP_LOSS", "title": "🚨 策略建議：跌穿成本 8%，絕對停損", "desc": f"當前淨值/價格 ({price:.2f}) 已跌破平均成本 8% 的絕對防守線 ({hard_stop_price:.2f})！請無條件全數斷頭出場，嚴格控制虧損。"}]
             
-            # 3. 技術線型破位止損 (抄底失敗早一步離場)
             if price < ma20 * 0.97:
                 return metrics, [{"type": "error", "action_code": "STOP_LOSS", "title": "⚠️ 策略建議：跌破月線防守，提早停損", "desc": f"實體跌破 MA20 生命線達 3%，中期趨勢已遭破壞，建議先行清倉觀望，保留資金實力。"}]
 
-        # ==================================
         # 進攻與建倉機制
-        # ==================================
         if tranches_held == 0:
             if rsi_bullish_div and temp < 35.0:
                 return metrics, [{"type": "success", "action_code": "BUY_40", "title": "🎯 策略建議：【極寒抄底】投入 40% 資金", "desc": f"RSI 底背離確立，且系統處於冰點 (溫度 {temp:.1f}°C)！建議投入 40% 資金 (~${target_capital * 0.4:,.0f} 元，約 {target_shares_40:,} 股/份)。"}]
@@ -404,13 +425,13 @@ class TradingStrategyEngine:
             else:
                 return metrics, [{"type": "info", "action_code": "HOLD", "title": "💤 策略建議：保留現金，耐心等待", "desc": f"當前溫度 {temp:.1f}°C，尚未出現【極寒抄底】或【黃金突破】訊號，請將 100% 資金保留為現金觀望。"}]
         
-        elif tranches_held > 0 and tranches_held < 9: # 已有部分持倉，等待打滿
+        elif tranches_held > 0 and tranches_held < 9:
             if breakout_20_high and 35.0 <= temp <= 80.0:
                 return metrics, [{"type": "success", "action_code": "BUY_REMAIN", "title": "🚀 策略建議：【黃金突破】打滿剩餘資金", "desc": f"趨勢強勢表態 (溫度 {temp:.1f}°C)！建議將剩餘的 60% 資金全數打滿，完成主升段重倉佈局。"}]
             else:
                 return metrics, [{"type": "info", "action_code": "HOLD", "title": "🟢 策略建議：持股續抱，等待突破", "desc": f"目前持有部分底倉 (平均成本 {avg_cost:.2f})。未達 8% 停損與黃金突破條件，建議抱單觀望。"}]
                 
-        else: # 滿倉狀態
+        else:
             return metrics, [{"type": "info", "action_code": "HOLD", "title": "🟢 策略建議：滿倉獲利奔跑中", "desc": f"目前已達 100% 滿倉狀態 (平均成本 {avg_cost:.2f})！系統已啟動【絕對 8% 停損】與【沸點反轉逃頂】監控，請安心讓利潤奔跑。"}]
 
     @staticmethod
@@ -470,7 +491,7 @@ class TradingStrategyEngine:
                     "detail": "當日無操作，完美規避了頻繁交易產生的摩擦成本，展現極高抱單定力。"
                 })
 
-        # --- 監控清單 ---
+        # 防守價位計算
         ma20 = metrics['MA20']
         high_20 = metrics['High_20']
         
@@ -599,12 +620,12 @@ def compute_position_summary(trades: list, current_price: float, target_capital:
 st.set_page_config(page_title="主升段最大化交易 App", layout="wide", page_icon="📈")
 st.markdown("""
     <style>
-        /* 擴大側邊欄底部的內距，讓最下方選單與按鈕不會被切掉 */
         [data-testid="stSidebar"] > div:first-child {
             padding-bottom: 150px;
         }
     </style>
 """, unsafe_allow_html=True)
+
 if "db" not in st.session_state:
     st.session_state.db = load_db()
 
