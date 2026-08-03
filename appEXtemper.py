@@ -760,7 +760,9 @@ with tab1:
         st.caption(f"🟢 行情來源: {source_used}")
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
-    m1.metric("最新價/淨值", f"{metrics['Close']:.4f}" if metrics['Close'] < 10 else f"{metrics['Close']:.2f}")
+    with m1:
+        st.metric("最新價/淨值", f"{metrics['Close']:.4f}" if metrics['Close'] < 10 else f"{metrics['Close']:.2f}")
+        st.caption(f"🕒 更新時間：{metrics.get('KLine_Date', '最新交易日')} (盤中延遲)")
     
     # 溫度顏色標示
     temp_val = metrics['Temperature']
